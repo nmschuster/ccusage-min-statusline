@@ -11,18 +11,12 @@ import { define } from 'gunshi';
 import pc from 'picocolors';
 import * as v from 'valibot';
 import { loadConfig, mergeConfigWithArgs } from '../_config-loader-tokens.ts';
-import { DEFAULT_CONTEXT_USAGE_THRESHOLDS, DEFAULT_REFRESH_INTERVAL_SECONDS } from '../_consts.ts';
+import { DEFAULT_REFRESH_INTERVAL_SECONDS } from '../_consts.ts';
 import { calculateBurnRate } from '../_session-blocks.ts';
 import { sharedArgs } from '../_shared-args.ts';
 import { statuslineHookJsonSchema } from '../_types.ts';
 import { getFileModifiedTime, unreachable } from '../_utils.ts';
-import { calculateTotals } from '../calculate-cost.ts';
-import {
-	calculateContextTokens,
-	loadDailyUsageData,
-	loadSessionBlockData,
-	loadSessionUsageById,
-} from '../data-loader.ts';
+import { loadSessionBlockData, loadSessionUsageById } from '../data-loader.ts';
 import { log, logger } from '../logger.ts';
 
 /**
@@ -81,27 +75,6 @@ type SemaphoreType = {
 const visualBurnRateChoices = ['off', 'emoji', 'text', 'emoji-text'] as const;
 const costSourceChoices = ['auto', 'ccusage', 'cc', 'both'] as const;
 
-// Valibot schema for context threshold validation
-const contextThresholdSchema = v.pipe(
-	v.union([
-		v.number(),
-		v.pipe(
-			v.string(),
-			v.trim(),
-			v.check((value) => /^-?\d+$/u.test(value), 'Context threshold must be an integer'),
-			v.transform((value) => Number.parseInt(value, 10)),
-		),
-	]),
-	v.number('Context threshold must be a number'),
-	v.integer('Context threshold must be an integer'),
-	v.minValue(0, 'Context threshold must be at least 0'),
-	v.maxValue(100, 'Context threshold must be at most 100'),
-);
-
-function parseContextThreshold(value: string): number {
-	return v.parse(contextThresholdSchema, value);
-}
-
 export const statuslineCommand = define({
 	name: 'statusline',
 	description:
@@ -142,31 +115,12 @@ export const statuslineCommand = define({
 			description: `Refresh interval in seconds for cache expiry (default: ${DEFAULT_REFRESH_INTERVAL_SECONDS})`,
 			default: DEFAULT_REFRESH_INTERVAL_SECONDS,
 		},
-		contextLowThreshold: {
-			type: 'custom',
-			description: 'Context usage percentage below which status is shown in green (0-100)',
-			parse: (value) => parseContextThreshold(value),
-			default: DEFAULT_CONTEXT_USAGE_THRESHOLDS.LOW,
-		},
-		contextMediumThreshold: {
-			type: 'custom',
-			description: 'Context usage percentage below which status is shown in yellow (0-100)',
-			parse: (value) => parseContextThreshold(value),
-			default: DEFAULT_CONTEXT_USAGE_THRESHOLDS.MEDIUM,
-		},
 		config: sharedArgs.config,
 		debug: sharedArgs.debug,
 	},
 	async run(ctx) {
 		// Set logger to silent for statusline output
 		logger.level = 0;
-
-		// Validate threshold ordering constraint: LOW must be less than MEDIUM
-		if (ctx.values.contextLowThreshold >= ctx.values.contextMediumThreshold) {
-			throw new Error(
-				`Context low threshold (${ctx.values.contextLowThreshold}) must be less than medium threshold (${ctx.values.contextMediumThreshold})`,
-			);
-		}
 
 		// Load configuration and merge with CLI args
 		const config = loadConfig(ctx.values.config, ctx.values.debug);
@@ -332,32 +286,6 @@ export const statuslineCommand = define({
 						return {}; // This line should never be reached
 					})();
 
-					// Load today's usage data
-					const today = new Date();
-					const todayStr = today.toISOString().split('T')[0]?.replace(/-/g, '') ?? ''; // Convert to YYYYMMDD format
-
-					const todayCost = await Result.pipe(
-						Result.try({
-							try: async () =>
-								loadDailyUsageData({
-									since: todayStr,
-									until: todayStr,
-									mode: 'auto',
-									offline: mergedOptions.offline,
-								}),
-							catch: (error) => error,
-						})(),
-						Result.map((dailyData) => {
-							if (dailyData.length > 0) {
-								const totals = calculateTotals(dailyData);
-								return totals.totalCost;
-							}
-							return 0;
-						}),
-						Result.inspectError((error) => logger.error('Failed to load daily data:', error)),
-						Result.unwrap(0),
-					);
-
 					// Load session block data to find active block
 					const { blockInfo, burnRateInfo } = await Result.pipe(
 						Result.try({
@@ -380,9 +308,7 @@ export const statuslineCommand = define({
 									return false;
 								}
 
-								// Check if any entry in this block matches our session
-								// Since we don't have direct session mapping in entries,
-								// we use the active block that's currently running
+								// Active block that's currently running
 								return true;
 							});
 
@@ -456,60 +382,7 @@ export const statuslineCommand = define({
 						Result.unwrap({ blockInfo: 'No active block', burnRateInfo: '' }),
 					);
 
-					// Helper function to format context info with color coding
-					const formatContextInfo = (inputTokens: number, contextLimit: number): string => {
-						const percentage = Math.round((inputTokens / contextLimit) * 100);
-						const color =
-							percentage < ctx.values.contextLowThreshold
-								? pc.green
-								: percentage < ctx.values.contextMediumThreshold
-									? pc.yellow
-									: pc.red;
-						const coloredPercentage = color(`${percentage}%`);
-						const tokenDisplay = inputTokens.toLocaleString();
-						return `${tokenDisplay} (${coloredPercentage})`;
-					};
-
-					// Get context tokens from Claude Code hook data, or fall back to calculating from transcript
-					const contextDataResult =
-						hookData.context_window != null
-							? // Prefer context_window data from Claude Code hook if available
-								Result.succeed({
-									inputTokens: hookData.context_window.total_input_tokens,
-									contextLimit: hookData.context_window.context_window_size,
-								})
-							: // Fall back to calculating context tokens from transcript
-								await Result.try({
-									try: async () =>
-										calculateContextTokens(
-											hookData.transcript_path,
-											hookData.model.id,
-											mergedOptions.offline,
-										),
-									catch: (error) => error,
-								})();
-
-					const contextInfo = Result.pipe(
-						contextDataResult,
-						Result.inspectError((error) =>
-							logger.debug(
-								`Failed to calculate context tokens: ${error instanceof Error ? error.message : String(error)}`,
-							),
-						),
-						Result.map((contextResult) => {
-							if (contextResult == null) {
-								return undefined;
-							}
-							return formatContextInfo(contextResult.inputTokens, contextResult.contextLimit);
-						}),
-						Result.unwrap(undefined),
-					);
-
-					// Get model display name
-					const modelName = hookData.model.display_name;
-
-					// Format and output the status line
-					// Format: 🤖 model | 💰 session / today / block | 🔥 burn | 🧠 context
+					// Session cost display
 					const sessionDisplay = (() => {
 						// If both costs are available, show them side by side
 						if (ccCost != null || ccusageCost != null) {
@@ -520,7 +393,10 @@ export const statuslineCommand = define({
 						// Single cost display
 						return sessionCost != null ? formatCurrency(sessionCost) : 'N/A';
 					})();
-					const statusLine = `🤖 ${modelName} | 💰 ${sessionDisplay} session / ${formatCurrency(todayCost)} today / ${blockInfo}${burnRateInfo} | 🧠 ${contextInfo ?? 'N/A'}`;
+
+					// Minimal statusline:
+					// Format: 💰 session / block | 🔥 burn
+					const statusLine = `💰 ${sessionDisplay} session / ${blockInfo}${burnRateInfo}`;
 					return statusLine;
 				},
 				catch: (error) => error,
@@ -549,8 +425,6 @@ export const statuslineCommand = define({
 
 		// Handle processing result
 		if (Result.isFailure(mainProcessingResult)) {
-			// Reset updating flag on error to prevent deadlock
-
 			// If we have a cached output from previous run, use it
 			if (initialSemaphoreState?.lastOutput != null && initialSemaphoreState.lastOutput !== '') {
 				log(initialSemaphoreState.lastOutput);
