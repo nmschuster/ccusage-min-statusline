@@ -319,7 +319,7 @@ export const statuslineCommand = define({
 								);
 								const blockCost = activeBlock.costUSD;
 
-								const blockInfo = `${formatCurrency(blockCost)} block (${formatRemainingTime(remaining)})`;
+								const blockInfo = `${formatCurrency(blockCost)} (${formatRemainingTime(remaining)})`;
 
 								// Calculate burn rate
 								const burnRate = calculateBurnRate(activeBlock);
@@ -369,7 +369,7 @@ export const statuslineCommand = define({
 													burnRateOutputSegments.push(coloredString(`(${textValue})`));
 												}
 
-												return ` | 🔥 ${burnRateOutputSegments.join(' ')}`;
+												return ` | ${burnRateOutputSegments.join(' ')}`;
 											})()
 										: '';
 
@@ -396,7 +396,7 @@ export const statuslineCommand = define({
 
 					// Minimal statusline:
 					// Format: 💰 session / block | 🔥 burn
-					const statusLine = `💰 ${sessionDisplay} session / ${blockInfo}${burnRateInfo}`;
+					const statusLine = `${blockInfo}${burnRateInfo}`;
 					return statusLine;
 				},
 				catch: (error) => error,
